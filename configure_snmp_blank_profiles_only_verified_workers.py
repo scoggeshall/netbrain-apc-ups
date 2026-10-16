@@ -21,6 +21,7 @@ import json
 import logging
 import re
 import signal
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -29,33 +30,23 @@ from apc_snmp_profiles import (
     build_v1_command,
     build_v3_access_command,
     build_v3_user_command,
+    classify_write_outcome,
     confirmed_blank_v1,
     confirmed_blank_v3_access,
     confirmed_blank_v3_user,
+    normalize_username,
     parse_v1_output,
     parse_v3_output,
 )
-
-try:
-    import paramiko
-except ImportError:
-    print("Missing dependency. Install with: py -m pip install paramiko")
-    raise SystemExit(2)
 
 BASE = Path(__file__).resolve().parent
 CREDENTIALS_FILE = BASE / "credentials.json"
 DEVICE_FILE = BASE / "device_list.csv"
 LOG_DIR = BASE / "Log"
-LOG_DIR.mkdir(exist_ok=True)
-LOG_FILE = LOG_DIR / f"configure_snmp_blank_profiles_only_{time.strftime('%Y%m%d_%H%M%S')}.log"
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8")],
-)
+LOG_FILE = None
 log = logging.getLogger("apc-snmp-blank-only")
 _stop = False
+_write_lock = threading.Lock()
 
 
 def read_json(path):
@@ -106,17 +97,28 @@ def redact_text(text, config):
         if len(secret) > 1:
             wrapped = r"\s*".join(re.escape(char) for char in secret)
             text = re.sub(wrapped, "<REDACTED>", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"(?im)\b(community|(?:auth(?:entication)?|privacy)\s+passphrase|password)\s*:\s*.*$",
+        r"\1: <REDACTED>",
+        text,
+    )
     return text
 
 
 def mask_command(command):
     # Commands are logged only in masked form; redact values after credential-bearing flags.
-    command = re.sub(r'(?i)(-c\d?\s+)(?:"[^"]*"|\S+)', r'\1<REDACTED>', command)
-    command = re.sub(r'(?i)(-a\d?\s+)(?:"[^"]*"|\S+)', r'\1<REDACTED>', command)
+    command = re.sub(r'(?i)(-c\d?\s+)(?:"[^"]*"|\S+)', r"\1<REDACTED>", command)
+    command = re.sub(r'(?i)(-a\d?\s+)(?:"[^"]*"|\S+)', r"\1<REDACTED>", command)
     return command
 
 
 def connect(host, ssh_cfg, timeout):
+    try:
+        import paramiko
+    except ImportError as exc:
+        raise RuntimeError(
+            "paramiko is required; install it with `py -m pip install paramiko`"
+        ) from exc
     attempts = [
         (ssh_cfg.get("username"), ssh_cfg.get("password")),
         (ssh_cfg.get("alt_username"), ssh_cfg.get("alt_password")),
@@ -132,15 +134,24 @@ def connect(host, ssh_cfg, timeout):
         client.set_missing_host_key_policy(paramiko.RejectPolicy())
         try:
             client.connect(
-                hostname=host, username=username, password=password,
-                timeout=timeout, banner_timeout=timeout, auth_timeout=timeout,
-                look_for_keys=False, allow_agent=False,
+                hostname=host,
+                username=username,
+                password=password,
+                timeout=timeout,
+                banner_timeout=timeout,
+                auth_timeout=timeout,
+                look_for_keys=False,
+                allow_agent=False,
             )
             return client
         except (paramiko.SSHException, OSError, TimeoutError) as exc:
             errors.append(f"{username}: {type(exc).__name__}")
             client.close()
-    raise RuntimeError("SSH connection failed: " + "; ".join(errors or ["no SSH credentials configured"]))
+            if not isinstance(exc, paramiko.AuthenticationException):
+                raise ConnectionError(f"SSH connection failed ({type(exc).__name__})") from exc
+    raise RuntimeError(
+        "SSH connection failed: " + "; ".join(errors or ["no SSH credentials configured"])
+    )
 
 
 ANSI_RE = re.compile(r"\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))")
@@ -183,22 +194,34 @@ def wait_for_prompt(shell, timeout):
                     return clean_text(buf)
                 stable_since = None
             time.sleep(0.05)
-    raise RuntimeError("Timed out waiting for APC CLI prompt before issuing commands. Partial output: " +
-                       clean_text(buf)[-1200:].replace("\n", " | "))
+    raise RuntimeError(
+        f"Timed out waiting for APC CLI prompt before issuing commands; received {len(buf)} bytes"
+    )
 
 
-def run_command(shell, command, timeout):
+def run_command(shell, command, timeout, *, write=False):
     # Do not issue a command if unexpected output is already buffered; command/response
     # alignment would be uncertain and a write could become unsafe.
     if shell.recv_ready():
         stale = clean_text(shell.recv(65535).decode("utf-8", errors="replace"))
         if stale.strip():
-            raise RuntimeError("Unexpected buffered SSH output before command; refusing to send. Output: " +
-                               stale[-800:].replace("\n", " | "))
-    try:
-        shell.sendall((command + "\r\n").encode("utf-8"))
-    except (paramiko.SSHException, OSError, TimeoutError) as exc:
-        return f"CLI send failed ({type(exc).__name__})", True
+            raise RuntimeError(
+                "Unexpected buffered SSH output before command; refusing to send "
+                f"({len(stale)} characters)"
+            )
+    if write:
+        with _write_lock:
+            if _stop:
+                return "operator interrupt received before write send", True
+            try:
+                shell.sendall((command + "\r\n").encode("utf-8"))
+            except Exception as exc:  # noqa: BLE001
+                return f"CLI send failed ({type(exc).__name__})", True
+    else:
+        try:
+            shell.sendall((command + "\r\n").encode("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            return f"CLI send failed ({type(exc).__name__})", True
     buf = ""
     deadline = time.monotonic() + timeout
     stable_since = None
@@ -206,7 +229,7 @@ def run_command(shell, command, timeout):
         if shell.recv_ready():
             try:
                 buf += shell.recv(65535).decode("utf-8", errors="replace")
-            except (paramiko.SSHException, OSError, TimeoutError) as exc:
+            except Exception as exc:  # noqa: BLE001
                 return f"{clean_text(buf)} CLI receive failed ({type(exc).__name__})", True
             if prompt_present(buf):
                 stable_since = stable_since or time.monotonic()
@@ -229,27 +252,67 @@ def run_command(shell, command, timeout):
     return clean_text(buf).strip(), True
 
 
-def outcome_class(output, partial=False):
-    if partial:
-        return "ambiguous"
-    if re.search(r"\bE00[1-9]:", output, re.IGNORECASE):
-        return "failure"
-    if len(re.findall(r"\bE\d{3}\s*:", output, re.IGNORECASE)) > 1:
-        return "ambiguous"
-    if re.search(r"\bE000:\s*Success\b", output, re.IGNORECASE):
-        return "success"
-    return "ambiguous"
+def safe_readback_summary(output, command, partial):
+    if command == "snmp":
+        table = parse_v1_output(output, partial=partial)
+        if not table.confident:
+            return f"parsed=false; reason={table.error}; raw_output=omitted"
+        entries = {
+            index: {
+                "community": "<REDACTED>",
+                "access": entry["access"],
+                "address": entry["address"],
+            }
+            for index, entry in table.entries.items()
+        }
+        return f"parsed=true; entries={entries}"
+    users, access = parse_v3_output(output, partial=partial)
+    if not users.confident or not access.confident:
+        return (
+            "parsed=false; "
+            f"user_profiles={users.error}; access_entries={access.error}; raw_output=omitted"
+        )
+    user_values = {
+        index: {
+            "username": entry["username"],
+            "authentication": entry["authentication"],
+            "privacy": entry["privacy"],
+            "passphrases": "<NOT READABLE>",
+        }
+        for index, entry in users.entries.items()
+    }
+    access_values = {
+        index: {
+            "username": entry["username"],
+            "access": entry["access"],
+            "address": entry["address"],
+        }
+        for index, entry in access.entries.items()
+    }
+    return f"parsed=true; users={user_values}; access={access_values}"
 
 
-def read_device_state(shell, host, config, phase, timeout):
+def read_device_state(shell, host, phase, timeout):
     out1, partial1 = run_command(shell, "snmp", timeout)
-    log.info("[%s] %s `snmp` readback partial=%s: %s", host, phase, partial1,
-             redact_text(out1, config).replace("\n", " | ")[:5000])
+    log.info(
+        "[%s] %s `snmp` readback partial=%s: %s",
+        host,
+        phase,
+        partial1,
+        safe_readback_summary(out1, "snmp", partial1),
+    )
     if partial1 or not out1:
-        raise RuntimeError(f"{phase}: SNMP readback incomplete/timeout; refusing to send another command")
+        raise RuntimeError(
+            f"{phase}: SNMP readback incomplete/timeout; refusing to send another command"
+        )
     out3, partial3 = run_command(shell, "snmpv3", timeout)
-    log.info("[%s] %s `snmpv3` readback partial=%s: %s", host, phase, partial3,
-             redact_text(out3, config).replace("\n", " | ")[:7000])
+    log.info(
+        "[%s] %s `snmpv3` readback partial=%s: %s",
+        host,
+        phase,
+        partial3,
+        safe_readback_summary(out3, "snmpv3", partial3),
+    )
     if partial3 or not out3:
         raise RuntimeError(f"{phase}: SNMPv3 readback incomplete/timeout; refusing writes")
     v1_table = parse_v1_output(out1, partial=partial1)
@@ -266,6 +329,11 @@ def read_device_state(shell, host, config, phase, timeout):
 
 def build_blank_slot_commands(config, state, host, allow_v3_privacy_flag=False):
     v1_table, v3_user_table, v3_access_table = state
+    if not all(table.confident for table in state):
+        log.warning(
+            "[%s] One or more SNMP tables are UNKNOWN; refusing all configuration writes.", host
+        )
+        return []
     v1_state = v1_table.entries
     v3_users = v3_user_table.entries
     v3_access = v3_access_table.entries
@@ -277,7 +345,9 @@ def build_blank_slot_commands(config, state, host, allow_v3_privacy_flag=False):
             continue
         existing = v1_state.get(index)
         if not existing or not confirmed_blank_v1(v1_table, index):
-            log.info("[%s] SNMPv1 entry %s is configured/ambiguous; leaving unchanged.", host, index)
+            log.info(
+                "[%s] SNMPv1 entry %s is configured/ambiguous; leaving unchanged.", host, index
+            )
             continue
         ip = str(item.get("nms_ip", "")).strip()
         community = str(item.get("community", "")).strip()
@@ -286,10 +356,17 @@ def build_blank_slot_commands(config, state, host, allow_v3_privacy_flag=False):
             log.warning("[%s] SNMPv1 profile %s missing nms_ip/community; skipping.", host, index)
             continue
         if access not in {"read", "write", "writeplus", "disable"}:
-            raise ValueError(f"snmpv1.profile{index}.access must be read, write, writeplus, or disable")
-        commands.append((f"Configure blank SNMPv1 entry {index}",
-                         build_v1_command(index, community, access, ip),
-                         True, ("v1", index)))
+            raise ValueError(
+                f"snmpv1.profile{index}.access must be read, write, writeplus, or disable"
+            )
+        commands.append(
+            (
+                f"Configure blank SNMPv1 entry {index}",
+                build_v1_command(index, community, access, ip),
+                True,
+                ("v1", index),
+            )
+        )
 
     for index in range(2, 5):  # Deliberately never touch SNMPv3 profile/access entry 1.
         item = config.get("snmpv3", {}).get(f"profile{index}", {})
@@ -315,9 +392,9 @@ def build_blank_slot_commands(config, state, host, allow_v3_privacy_flag=False):
             raise ValueError(f"snmpv3.profile{index}.privacy_protocol must be aes, des, or none")
         user_blank = confirmed_blank_v3_user(v3_user_table, index)
         user_matches = (
-            norm(user.get("username")) == norm(username)
+            normalize_username(user.get("username")) == normalize_username(username)
             and norm(user.get("authentication")) == norm(auth_protocol)
-            and norm(user.get("encryption")) == norm(privacy_protocol)
+            and norm(user.get("privacy")) == norm(privacy_protocol)
         )
         if user_blank and not allow_v3_privacy_flag:
             log.warning(
@@ -328,25 +405,39 @@ def build_blank_slot_commands(config, state, host, allow_v3_privacy_flag=False):
             )
             continue
         if user_blank:
-            commands.append((f"Configure blank SNMPv3 user profile {index}",
-                             build_v3_user_command(
-                                 index,
-                                 username,
-                                 auth_protocol,
-                                 privacy_protocol,
-                                 auth,
-                                 privacy,
-                             ),
-                             True, ("v3_user", index)))
+            commands.append(
+                (
+                    f"Configure blank SNMPv3 user profile {index}",
+                    build_v3_user_command(
+                        index,
+                        username,
+                        auth_protocol,
+                        privacy_protocol,
+                        auth,
+                        privacy,
+                    ),
+                    True,
+                    ("v3_user", index),
+                )
+            )
             user_ready = True
         else:
-            log.info("[%s] SNMPv3 user profile %s is configured/ambiguous; leaving unchanged.", host, index)
+            log.info(
+                "[%s] SNMPv3 user profile %s is configured/ambiguous; leaving unchanged.",
+                host,
+                index,
+            )
             user_ready = user_matches
 
         if user_ready and confirmed_blank_v3_access(v3_access_table, index):
-            commands.append((f"Configure blank SNMPv3 access-control entry {index}",
-                             build_v3_access_command(index, username, ip),
-                             False, ("v3_access", index)))
+            commands.append(
+                (
+                    f"Configure blank SNMPv3 access-control entry {index}",
+                    build_v3_access_command(index, username, ip),
+                    False,
+                    ("v3_access", index),
+                )
+            )
         elif not user_ready:
             log.info(
                 "[%s] SNMPv3 access entry %s is not being changed because its user profile "
@@ -355,7 +446,11 @@ def build_blank_slot_commands(config, state, host, allow_v3_privacy_flag=False):
                 index,
             )
         else:
-            log.info("[%s] SNMPv3 access entry %s is configured/ambiguous; leaving unchanged.", host, index)
+            log.info(
+                "[%s] SNMPv3 access entry %s is configured/ambiguous; leaving unchanged.",
+                host,
+                index,
+            )
 
     return commands
 
@@ -373,8 +468,10 @@ def verify_changed(state, config, touched):
         if kind == "v1":
             item = config.get("snmpv1", {}).get(f"profile{index}", {})
             actual = v1_state[index]
-            expected_access = str(item.get("access", "read")).strip().lower().replace("writeplus", "write +")
-            if norm(actual.get("community")) != norm(item.get("community")):
+            expected_access = (
+                str(item.get("access", "read")).strip().lower().replace("writeplus", "write +")
+            )
+            if str(actual.get("community", "")).strip() != str(item.get("community", "")).strip():
                 failures.append(f"SNMPv1 entry {index} community mismatch")
             if norm(actual.get("access")) != norm(expected_access):
                 failures.append(f"SNMPv1 entry {index} access mismatch")
@@ -383,7 +480,9 @@ def verify_changed(state, config, touched):
         elif kind == "v3_user":
             item = config.get("snmpv3", {}).get(f"profile{index}", {})
             actual = v3_users[index]
-            if norm(actual.get("username")) != norm(item.get("username")):
+            if normalize_username(actual.get("username")) != normalize_username(
+                item.get("username")
+            ):
                 failures.append(f"SNMPv3 user profile {index} username mismatch")
             if norm(actual.get("authentication")) != norm(item.get("auth_protocol", "sha")):
                 failures.append(f"SNMPv3 user profile {index} authentication mismatch")
@@ -392,7 +491,9 @@ def verify_changed(state, config, touched):
         elif kind == "v3_access":
             item = config.get("snmpv3", {}).get(f"profile{index}", {})
             actual = v3_access[index]
-            if norm(actual.get("username")) != norm(item.get("username")):
+            if normalize_username(actual.get("username")) != normalize_username(
+                item.get("username")
+            ):
                 failures.append(f"SNMPv3 access entry {index} username mismatch")
             if norm(actual.get("access")) not in {"enabled", "enable"}:
                 failures.append(f"SNMPv3 access entry {index} is not enabled")
@@ -410,14 +511,19 @@ def configure_device(
     allow_v3_privacy_flag=False,
 ):
     client = None
+    write_attempted = False
     try:
         client = connect(host, config.get("ssh", {}), conn_timeout)
         shell = client.invoke_shell(width=240, height=60)
         banner = wait_for_prompt(shell, cmd_timeout)
         log.info("[%s] SSH connected; APC CLI prompt ready.", host)
-        log.debug("[%s] Initial shell text: %s", host, redact_text(banner, config)[-1500:].replace("\n", " | "))
+        log.debug(
+            "[%s] Initial shell text: %s",
+            host,
+            redact_text(banner, config)[-1500:].replace("\n", " | "),
+        )
 
-        preflight = read_device_state(shell, host, config, "Preflight", cmd_timeout)
+        preflight = read_device_state(shell, host, "Preflight", cmd_timeout)
         commands = build_blank_slot_commands(
             config, preflight, host, allow_v3_privacy_flag=allow_v3_privacy_flag
         )
@@ -426,20 +532,35 @@ def configure_device(
 
         if dry_run:
             for label, command, secret, tag in commands:
-                log.info("[%s] DRY RUN %s: %s", host, label, mask_command(command) if secret else command)
+                log.info(
+                    "[%s] DRY RUN %s: %s", host, label, mask_command(command) if secret else command
+                )
             return host, f"DRY RUN ({len(commands)} candidate command(s); no writes sent)"
 
         touched = set()
         for label, command, contains_secret, tag in commands:
             if _stop:
                 return host, "STOPPED (interrupt requested; no more writes)"
-            log.info("[%s] %s command: %s", host, label,
-                     mask_command(command) if contains_secret else command)
-            output, partial = run_command(shell, command, cmd_timeout)
-            outcome = outcome_class(output, partial)
-            log.info("[%s] %s outcome=%s partial=%s output=%s", host, label, outcome, partial,
-                     redact_text(output, config).replace("\n", " | ")[:1800])
+            log.info(
+                "[%s] %s command: %s",
+                host,
+                label,
+                mask_command(command) if contains_secret else command,
+            )
+            write_attempted = True
+            output, partial = run_command(shell, command, cmd_timeout, write=True)
+            outcome = classify_write_outcome(output, partial)
+            log.info(
+                "[%s] %s outcome=%s partial=%s output=%s",
+                host,
+                label,
+                outcome,
+                partial,
+                mask_command(redact_text(output, config)).replace("\n", " | "),
+            )
 
+            if output.startswith("operator interrupt received before write send"):
+                return host, "STOPPED before write send (no rollback attempted)"
             if outcome == "failure":
                 raise RuntimeError(f"{label} returned explicit APC error; stopping this device")
             if outcome == "success" and not partial:
@@ -447,8 +568,12 @@ def configure_device(
                 continue
 
             # Ambiguous or incomplete response: read back only; do not resend the write.
-            log.warning("[%s] %s outcome ambiguous; verifying by readback and stopping further writes.", host, label)
-            state = read_device_state(shell, host, config, "Ambiguous-readback", cmd_timeout)
+            log.warning(
+                "[%s] %s outcome ambiguous; verifying by readback and stopping further writes.",
+                host,
+                label,
+            )
+            state = read_device_state(shell, host, "Ambiguous-readback", cmd_timeout)
             failures = verify_changed(state, config, {tag})
             if failures:
                 raise RuntimeError(
@@ -457,7 +582,7 @@ def configure_device(
             touched.add(tag)
             break
 
-        final_state = read_device_state(shell, host, config, "Final", cmd_timeout)
+        final_state = read_device_state(shell, host, "Final", cmd_timeout)
         failures = verify_changed(final_state, config, touched)
         if failures:
             for failure in failures:
@@ -477,20 +602,28 @@ def configure_device(
     except Exception as exc:  # noqa: BLE001
         safe_message = redact_text(str(exc), config)
         log.error("[%s] SAFETY STOP: %s", host, safe_message)
-        status = "UNKNOWN/SAFETY STOP" if "UNKNOWN" in safe_message else "FAILED/SAFETY STOP"
+        status = (
+            "UNKNOWN/SAFETY STOP"
+            if write_attempted or "UNKNOWN" in safe_message
+            else "FAILED/SAFETY STOP"
+        )
         return host, f"{status}: {safe_message}"
     finally:
         if client:
             try:
                 client.close()
-            except (paramiko.SSHException, OSError) as exc:
+            except Exception as exc:  # noqa: BLE001
                 log.debug("[%s] SSH close failed: %s", host, type(exc).__name__)
 
 
 def handle_sigint(signum, frame):
     global _stop
-    _stop = True
-    print("\nCtrl+C received: stopping submission of new devices; active device tasks will finish/timeout.", flush=True)
+    with _write_lock:
+        _stop = True
+    print(
+        "\nCtrl+C received: stopping submission of new devices; active device tasks will finish/timeout.",
+        flush=True,
+    )
 
 
 def validate_verification_report(path, devices):
@@ -499,16 +632,16 @@ def validate_verification_report(path, devices):
         if not reader.fieldnames or not {"device_ip", "verification_status"}.issubset(
             reader.fieldnames
         ):
-            raise ValueError("verification report must contain device_ip and verification_status columns")
+            raise ValueError(
+                "verification report must contain device_ip and verification_status columns"
+            )
         statuses = {
-            str(row.get("device_ip", "")).strip(): str(
-                row.get("verification_status", "")
-            ).strip().upper()
+            str(row.get("device_ip", "")).strip(): str(row.get("verification_status", ""))
+            .strip()
+            .upper()
             for row in reader
         }
-    not_verified = [
-        host for host in devices if statuses.get(host) != "VERIFIED"
-    ]
+    not_verified = [host for host in devices if statuses.get(host) != "VERIFIED"]
     if not_verified:
         raise ValueError(
             "broader write requires VERIFIED report rows for every device; "
@@ -517,14 +650,25 @@ def validate_verification_report(path, devices):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Configure only confirmed-blank APC NMC SNMP slots.")
-    parser.add_argument("--workers", type=int, default=5, help="Maximum concurrent devices (1-25; default 5)")
-    parser.add_argument("--conn-timeout", type=int, default=20, help="SSH connect/auth/banner timeout seconds")
+    global LOG_FILE
+    parser = argparse.ArgumentParser(
+        description="Configure only confirmed-blank APC NMC SNMP slots."
+    )
+    parser.add_argument(
+        "--workers", type=int, default=5, help="Maximum concurrent devices (1-25; default 5)"
+    )
+    parser.add_argument(
+        "--conn-timeout", type=int, default=20, help="SSH connect/auth/banner timeout seconds"
+    )
     parser.add_argument("--cmd-timeout", type=int, default=30, help="Per-command timeout seconds")
     parser.add_argument("--host", help="Process only this exact host/IP from device_list.csv")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--write", action="store_true", help="Allow configuration writes (requires explicit scope)")
-    mode.add_argument("--dry-run", action="store_true", help="Explicitly plan changes without any writes")
+    mode.add_argument(
+        "--write", action="store_true", help="Allow configuration writes (requires explicit scope)"
+    )
+    mode.add_argument(
+        "--dry-run", action="store_true", help="Explicitly plan changes without any writes"
+    )
     parser.add_argument(
         "--allow-broader-run",
         action="store_true",
@@ -546,11 +690,20 @@ def main():
         parser.error("--workers must be between 1 and 25")
     if args.conn_timeout < 1 or args.cmd_timeout < 1:
         parser.error("timeouts must be positive")
+    LOG_DIR.mkdir(exist_ok=True)
+    LOG_FILE = LOG_DIR / f"configure_snmp_blank_profiles_only_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8")],
+    )
     signal.signal(signal.SIGINT, handle_sigint)
 
     try:
         config = read_json(CREDENTIALS_FILE)
         ssh_cfg = config.get("ssh", {})
+        if not isinstance(ssh_cfg, dict):
+            raise TypeError("credentials.json ssh section must be an object")
         if not ssh_cfg.get("username") or not ssh_cfg.get("password"):
             raise ValueError("credentials.json requires ssh.username and ssh.password")
         raw_devices = read_devices(DEVICE_FILE)
@@ -597,9 +750,17 @@ def main():
             while not _stop and next_index < len(devices) and len(futures) < args.workers:
                 host = devices[next_index]
                 next_index += 1
-                futures[pool.submit(configure_device, host, config, args.conn_timeout,
-                                    args.cmd_timeout, dry_run,
-                                    args.confirm_v3_privacy_flag_c)] = host
+                futures[
+                    pool.submit(
+                        configure_device,
+                        host,
+                        config,
+                        args.conn_timeout,
+                        args.cmd_timeout,
+                        dry_run,
+                        args.confirm_v3_privacy_flag_c,
+                    )
+                ] = host
             if not futures:
                 break
             done = next((f for f in futures if f.done()), None)

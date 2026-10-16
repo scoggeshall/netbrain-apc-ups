@@ -23,7 +23,9 @@ V1_FIELDS = {
 V3_USER_FIELDS = {
     "username": re.compile(r"^(?:User\s*Name|Username)\s*:\s*(.*)$", re.IGNORECASE),
     "authentication": re.compile(
-        r"^(?:Authentication(?:\s+Protocol)?|Auth(?:entication)?)\s*:\s*(.*)$", re.IGNORECASE
+        r"^(?:Authentication(?:\s+Protocol)?|Auth(?:entication)?(?:\s+(?:Protocol|Type))?)"
+        r"\s*:\s*(.*)$",
+        re.IGNORECASE,
     ),
     "privacy": re.compile(
         r"^(?:Privacy(?:\s+Protocol)?|Encryption(?:\s+Protocol)?)\s*:\s*(.*)$", re.IGNORECASE
@@ -31,7 +33,8 @@ V3_USER_FIELDS = {
 }
 V3_ACCESS_FIELDS = {
     "username": re.compile(
-        r"^(?:Access\s+User(?:\s+Profile)?(?:\s+Name)?|User\s*Name|Username)\s*:\s*(.*)$",
+        r"^(?:Access\s+User(?:\s+Profile)?(?:\s+Name)?|User\s+Profile\s+Name|"
+        r"User\s*Name|Username)\s*:\s*(.*)$",
         re.IGNORECASE,
     ),
     "access": re.compile(r"^(?:Access|Status)\s*:\s*(.*)$", re.IGNORECASE),
@@ -45,17 +48,6 @@ V3_ACCESS_FIELDS = {
 class ParsedTable:
     entries: dict[int, dict[str, str]]
     confident: bool
-    error: str = ""
-
-
-@dataclass(frozen=True)
-class DeviceVerification:
-    values: dict[str, Any]
-    connection_status: str
-    consistency: str
-    verification_status: str
-    parsed_confidently: bool
-    firmware: str = ""
     error: str = ""
 
 
@@ -73,6 +65,22 @@ def clean_cli_text(text: str) -> str:
 
 def normalize(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def normalize_username(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def classify_write_outcome(output: str, partial: bool = False) -> str:
+    if partial:
+        return "ambiguous"
+    if re.search(r"\bE00[1-9]:", output, re.IGNORECASE):
+        return "failure"
+    if len(re.findall(r"\bE\d{3}\s*:", output, re.IGNORECASE)) > 1:
+        return "ambiguous"
+    if re.search(r"\bE000:\s*Success\b", output, re.IGNORECASE):
+        return "success"
+    return "ambiguous"
 
 
 def _quoted_cli_value(value: str, field: str) -> str:
@@ -130,16 +138,19 @@ def build_v3_access_command(index: int, username: str, address: str) -> str:
 
 def _heading_index(line: str, kind: str) -> int | None:
     if kind == "user":
-        pattern = r"^(?:SNMPv3\s+)?User\s+Profile\s*(?:#\s*)?([1-4])\s*:?\s*$"
+        pattern = (
+            r"^(?:(?:SNMPv3\s+)?(?:User\s+Profile|Index))"
+            r"\s*:?\s*#?\s*([1-4])\s*:?\s*$"
+        )
     elif kind == "access":
         pattern = (
-            r"^(?:(?:SNMPv[13])\s+)?Access\s+Control"
-            r"(?:\s+Entry)?\s*(?:#\s*)?([1-4])\s*:?\s*$"
+            r"^(?:(?:SNMPv[13]\s+)?(?:Access\s+Control(?:\s+Entry)?|Index))"
+            r"\s*:?\s*#?\s*([1-4])\s*:?\s*$"
         )
     elif kind == "v1":
         pattern = (
-            r"^(?:(?:SNMPv1)\s+)?(?:Access\s+Control(?:\s+Entry)?|Entry|Profile)"
-            r"\s*(?:#\s*)?([1-4])\s*:?\s*$"
+            r"^(?:(?:SNMPv1)\s+)?(?:Access\s+Control(?:\s+Entry)?|Entry|Profile|Index)"
+            r"\s*(?::\s*)?(?:#\s*)?([1-4])\s*:?\s*$"
         )
     else:
         raise ValueError(f"Unknown table kind: {kind}")
@@ -154,9 +165,21 @@ def _parse_blocks(text: str, kind: str, field_patterns: dict[str, re.Pattern[str
     current: int | None = None
     pending_field: str | None = None
     previous_field: str | None = None
+    duplicate_fields: set[tuple[int, str]] = set()
+    unexpected_index = False
     for raw_line in lines:
         line = raw_line.strip()
         index = _heading_index(line, kind)
+        if index is None and re.search(
+            r"\b(?:Profile|Entry|Index|Access\s+Control|User\s+Profile)\s*#?\s*\d+\s*$",
+            line,
+            re.IGNORECASE,
+        ):
+            number = re.search(r"(\d+)\s*$", line)
+            if number and int(number.group(1)) not in range(1, 5):
+                unexpected_index = True
+                current = None
+                continue
         if index is not None:
             if index in blocks:
                 duplicates.add(index)
@@ -173,7 +196,10 @@ def _parse_blocks(text: str, kind: str, field_patterns: dict[str, re.Pattern[str
             if match:
                 value = match.group(1).strip()
                 if value:
-                    blocks[current][key] = value
+                    if key in blocks[current]:
+                        duplicate_fields.add((current, key))
+                    else:
+                        blocks[current][key] = value
                     pending_field = None
                     previous_field = key
                 else:
@@ -185,7 +211,10 @@ def _parse_blocks(text: str, kind: str, field_patterns: dict[str, re.Pattern[str
             continue
         if pending_field and line and not _is_table_heading(line):
             key = pending_field
-            blocks[current][key] = line
+            if key in blocks[current]:
+                duplicate_fields.add((current, key))
+            else:
+                blocks[current][key] = line
             pending_field = None
             previous_field = key
             continue
@@ -198,6 +227,10 @@ def _parse_blocks(text: str, kind: str, field_patterns: dict[str, re.Pattern[str
     complete = all(index in blocks and required.issubset(blocks[index]) for index in range(1, 5))
     if duplicates:
         return ParsedTable(blocks, False, f"duplicate table entries: {sorted(duplicates)}")
+    if duplicate_fields:
+        return ParsedTable(blocks, False, f"duplicate fields: {sorted(duplicate_fields)}")
+    if unexpected_index:
+        return ParsedTable(blocks, False, "unexpected table index")
     if not complete:
         missing = [
             f"{index}:{','.join(sorted(required - set(blocks.get(index, {}))))}"
@@ -208,6 +241,23 @@ def _parse_blocks(text: str, kind: str, field_patterns: dict[str, re.Pattern[str
     if TRUNCATION_RE.search(lines[-1].strip()) if lines else True:
         return ParsedTable(blocks, False, "output may be truncated")
     return ParsedTable(blocks, True)
+
+
+def _validate_values(
+    table: ParsedTable, fields: dict[str, set[str]], table_name: str
+) -> ParsedTable:
+    if not table.confident:
+        return table
+    invalid = [
+        f"{index}:{field}={value}"
+        for index, entry in table.entries.items()
+        for field, allowed in fields.items()
+        if field in entry and normalize(entry[field]) not in allowed
+        for value in (entry[field],)
+    ]
+    if invalid:
+        return ParsedTable(table.entries, False, f"unrecognized {table_name} values: {invalid}")
+    return table
 
 
 def _is_table_heading(line: str) -> bool:
@@ -226,6 +276,11 @@ def _is_table_heading(line: str) -> bool:
 
 def parse_v1_output(text: str, *, partial: bool = False) -> ParsedTable:
     parsed = _parse_blocks(text, "v1", V1_FIELDS)
+    parsed = _validate_values(
+        parsed,
+        {"access": {"read", "write", "writeplus", "write+", "write +", "disabled", "disable"}},
+        "SNMPv1",
+    )
     if partial:
         return ParsedTable(parsed.entries, False, "command response was partial")
     return parsed
@@ -258,8 +313,19 @@ def parse_v3_output(text: str, *, partial: bool = False) -> tuple[ParsedTable, P
             {}, False, "separate user-profile and access-control headings not found"
         )
         return unknown, unknown
-    users = _parse_blocks(sections[0], "user", V3_USER_FIELDS)
-    access = _parse_blocks(sections[1], "access", V3_ACCESS_FIELDS)
+    users = _validate_values(
+        _parse_blocks(sections[0], "user", V3_USER_FIELDS),
+        {
+            "authentication": {"sha", "md5", "none"},
+            "privacy": {"aes", "des", "none"},
+        },
+        "SNMPv3 user-profile",
+    )
+    access = _validate_values(
+        _parse_blocks(sections[1], "access", V3_ACCESS_FIELDS),
+        {"access": {"enabled", "enable", "disabled", "disable"}},
+        "SNMPv3 access-control",
+    )
     if partial:
         reason = "command response was partial"
         users = ParsedTable(users.entries, False, reason)
@@ -322,8 +388,8 @@ def verify_readbacks(
     consistency = "UNKNOWN"
     if users.confident and access.confident:
         consistent = all(
-            normalize(users.entries[index]["username"])
-            == normalize(access.entries[index]["username"])
+            normalize_username(users.entries[index]["username"])
+            == normalize_username(access.entries[index]["username"])
             for index in range(1, 5)
         )
         consistency = "CONSISTENT" if consistent else "INCONSISTENT"

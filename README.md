@@ -35,8 +35,8 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[dev]"
 pytest -q
-ruff check src tests
-ruff format --check src tests
+ruff check src tests apc_snmp_profiles.py verify_apc_snmp_profiles.py configure_snmp_blank_profiles_only_verified_workers.py
+ruff format --check src tests apc_snmp_profiles.py verify_apc_snmp_profiles.py configure_snmp_blank_profiles_only_verified_workers.py
 ```
 
 ### Windows PowerShell
@@ -46,8 +46,8 @@ py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
 pytest -q
-ruff check src tests
-ruff format --check src tests
+ruff check src tests apc_snmp_profiles.py verify_apc_snmp_profiles.py configure_snmp_blank_profiles_only_verified_workers.py
+ruff format --check src tests apc_snmp_profiles.py verify_apc_snmp_profiles.py configure_snmp_blank_profiles_only_verified_workers.py
 ```
 
 ## Parse and evaluate
@@ -84,7 +84,8 @@ Ambiguous, unitless, malformed, and duplicate runtime values are rejected.
 The standalone `verify_apc_snmp_profiles.py` script reads the existing
 `credentials.json` and `device_list.csv` files. It requires Paramiko and a
 trusted host key in the user's SSH `known_hosts` file (or the configured
-`ssh.known_hosts` file). It sends only `snmp` and `snmpv3`, does not alter global
+`ssh.known_hosts` file); install Paramiko with `py -m pip install paramiko`.
+It sends only `snmp` and `snmpv3`, does not alter global
 SNMP settings, and never reboots a device.
 
 Run it from the repository directory against one allowlisted device:

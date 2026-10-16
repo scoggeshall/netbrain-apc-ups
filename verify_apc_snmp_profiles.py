@@ -55,12 +55,6 @@ def connect(host: str, ssh_cfg: dict, timeout: int):
             "paramiko is required; install it with `python -m pip install paramiko`"
         ) from exc
 
-    client = paramiko.SSHClient()
-    client.load_system_host_keys()
-    known_hosts = ssh_cfg.get("known_hosts")
-    if known_hosts:
-        client.load_host_keys(str(Path(known_hosts).expanduser()))
-    client.set_missing_host_key_policy(paramiko.RejectPolicy())
     attempts = (
         (ssh_cfg.get("username"), ssh_cfg.get("password")),
         (ssh_cfg.get("alt_username"), ssh_cfg.get("alt_password")),
@@ -69,6 +63,12 @@ def connect(host: str, ssh_cfg: dict, timeout: int):
     for username, password in attempts:
         if not username or not password:
             continue
+        client = paramiko.SSHClient()
+        client.load_system_host_keys()
+        known_hosts = ssh_cfg.get("known_hosts")
+        if known_hosts:
+            client.load_host_keys(str(Path(known_hosts).expanduser()))
+        client.set_missing_host_key_policy(paramiko.RejectPolicy())
         try:
             client.connect(
                 hostname=host,
@@ -81,9 +81,14 @@ def connect(host: str, ssh_cfg: dict, timeout: int):
                 allow_agent=False,
             )
             return client
-        except (paramiko.SSHException, OSError, TimeoutError) as exc:
+        except paramiko.AuthenticationException as exc:
             errors.append(type(exc).__name__)
-    client.close()
+            client.close()
+        except (paramiko.SSHException, OSError, TimeoutError) as exc:
+            client.close()
+            raise RuntimeError(f"SSH connection failed ({type(exc).__name__})") from exc
+    if not errors:
+        raise RuntimeError("SSH connection failed (no SSH credentials configured)")
     raise RuntimeError("SSH connection failed (" + ", ".join(errors or ["no credentials"]) + ")")
 
 
