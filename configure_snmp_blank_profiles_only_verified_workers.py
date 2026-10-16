@@ -531,9 +531,13 @@ def configure_device(
             return host, "NO CHANGES (no confirmed blank slots matched enabled JSON profiles)"
 
         if dry_run:
-            for label, command, secret, tag in commands:
+            for label, _command, _secret, tag in commands:
                 log.info(
-                    "[%s] DRY RUN %s: %s", host, label, mask_command(command) if secret else command
+                    "[%s] DRY RUN %s category=%s index=%s (command not sent)",
+                    host,
+                    label,
+                    tag[0],
+                    tag[1],
                 )
             return host, f"DRY RUN ({len(commands)} candidate command(s); no writes sent)"
 
@@ -542,10 +546,11 @@ def configure_device(
             if _stop:
                 return host, "STOPPED (interrupt requested; no more writes)"
             log.info(
-                "[%s] %s command: %s",
+                "[%s] %s category=%s index=%s (command text omitted)",
                 host,
                 label,
-                mask_command(command) if contains_secret else command,
+                tag[0],
+                tag[1],
             )
             write_attempted = True
             output, partial = run_command(shell, command, cmd_timeout, write=True)
