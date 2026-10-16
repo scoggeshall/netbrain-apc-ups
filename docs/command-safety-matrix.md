@@ -23,6 +23,8 @@ before enabling commands beyond the fixed runtime allowlist.
 | `cfgshutdn -all` | Shutdown configuration | Rejected; not in allowlist | Must not be enabled without authoritative proof that invocation is strictly read-only |
 | `cfgpower -all` | Power/outlet configuration | Rejected; not in allowlist | Must not be enabled without authoritative proof that invocation is strictly read-only |
 | `about` | NMC/system information | Disabled | Not verified |
+| `snmp` | SNMPv1 access entries 1-4 | Used only by the standalone read-only profile verifier | Read-only use is inferred from the existing script behavior; authoritative compatibility and output format are unverified |
+| `snmpv3` | SNMPv3 user/access-control entries 1-4 | Used only by the standalone read-only profile verifier | Read-only use is inferred from the existing script behavior; authoritative compatibility and output format are unverified |
 | `eventlog` | Event history | Excluded from automation | Potentially interactive; use manual troubleshooting only unless a safe noninteractive retrieval method is verified |
 
 The allowlist in `src/netbrain_apc_ups/collectors/cli.py` includes only
@@ -31,6 +33,12 @@ with no user-provided command string. A transport timeout or connection failure
 stops collection without retrying. A fallback is attempted only after the
 primary command is explicitly unsupported or its output cannot be parsed; the
 fallback is itself fixed and allowlisted.
+
+The separate `verify_apc_snmp_profiles.py` script has a fixed read-only
+allowlist of `snmp` and `snmpv3`; it does not use the package collector's
+allowlist. Those commands and their output formats still require confirmation
+against authoritative documentation for each target card and firmware. The
+profile configuration script does not alter global SNMP state or reboot cards.
 
 ## Verification sources required
 
