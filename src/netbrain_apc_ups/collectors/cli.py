@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum
 from typing import Protocol
 
 from netbrain_apc_ups.intents.runtime import RuntimeIntentResult, RuntimeStatus, evaluate_runtime_intent
@@ -13,7 +13,7 @@ from netbrain_apc_ups.parsers.runtime import RuntimeParseError, parse_remaining_
 logger = logging.getLogger(__name__)
 
 
-class ReadOnlyCommand(StrEnum):
+class ReadOnlyCommand(str, Enum):
     RUNTIME = "detstatus -rt"
     DETAILS = "detstatus -all"
 
@@ -23,7 +23,7 @@ class ReadOnlyCommand(StrEnum):
 ALLOWED_COMMANDS = frozenset(ReadOnlyCommand)
 
 
-class CommandStatus(StrEnum):
+class CommandStatus(str, Enum):
     OK = "OK"
     UNSUPPORTED = "UNSUPPORTED"
     ERROR = "ERROR"

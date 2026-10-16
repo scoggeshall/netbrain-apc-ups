@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from enum import StrEnum
+from enum import Enum
 
 
-class RuntimeStatus(StrEnum):
+class RuntimeStatus(str, Enum):
     PASS = "PASS"
     WARN = "WARN"
     FAIL = "FAIL"
