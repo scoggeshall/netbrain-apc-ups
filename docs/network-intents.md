@@ -18,6 +18,10 @@ An optional warning threshold must be greater than or equal to the pass
 threshold. It applies only above the pass threshold, so it cannot change the
 default pass/fail outcome. Results include seconds, fractional minutes, raw
 value, command, threshold, and status.
+When the collector falls back, the result's diagnostic reason retains the
+unsupported or unparseable primary-command outcome even if the fallback supplies
+a valid measurement. If collection still cannot establish runtime, diagnostics
+include each attempted command's unsupported, missing, or malformed outcome.
 
 The parser is independent of the network transport. Synthetic fixtures cover
 clock and explicit-unit examples. No sanitized real device capture has been

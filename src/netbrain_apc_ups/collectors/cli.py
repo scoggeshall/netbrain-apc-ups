@@ -60,23 +60,24 @@ class CliCollector:
     ) -> CliCollection:
         attempted: list[str] = []
         unsupported_count = 0
-        last_reason = "Runtime measurement unavailable"
+        diagnostics: list[str] = []
         for command in (ReadOnlyCommand.RUNTIME, ReadOnlyCommand.DETAILS):
             attempted.append(command.value)
             try:
                 output = self._transport.execute_read_only(command.value, self._timeout_seconds)
             except UnsupportedCommandError:
                 unsupported_count += 1
-                last_reason = f"{command.value} is not supported by this device"
+                diagnostics.append(f"{command.value}: command explicitly unsupported")
                 logger.info("Approved APC command is unsupported: %s", command.value)
                 continue
             except (TimeoutError, OSError) as error:
                 status = RuntimeStatus.UNKNOWN
-                last_reason = (
+                reason = (
                     "CLI collection timed out"
                     if isinstance(error, TimeoutError)
                     else "CLI connection failed"
                 )
+                diagnostics.append(f"{command.value}: {reason}")
                 return CliCollection(
                     runtime=evaluate_runtime_intent(
                         device_name,
@@ -85,12 +86,16 @@ class CliCollector:
                         warning_threshold_seconds,
                         source_command=command.value,
                         unavailable_status=status,
-                        reason=last_reason,
+                        reason="; ".join(diagnostics),
                     ),
                     commands_attempted=tuple(attempted),
                 )
-            except Exception:
+            except Exception as error:
                 logger.exception("Unexpected error collecting approved APC command")
+                diagnostics.append(
+                    f"{command.value}: unexpected CLI collection error "
+                    f"({type(error).__name__})"
+                )
                 return CliCollection(
                     runtime=evaluate_runtime_intent(
                         device_name,
@@ -98,7 +103,7 @@ class CliCollector:
                         threshold_seconds,
                         warning_threshold_seconds,
                         source_command=command.value,
-                        reason="Unexpected CLI collection error",
+                        reason="; ".join(diagnostics),
                     ),
                     commands_attempted=tuple(attempted),
                 )
@@ -106,7 +111,7 @@ class CliCollector:
             try:
                 measurement = parse_remaining_runtime(output)
             except RuntimeParseError as error:
-                last_reason = str(error)
+                diagnostics.append(f"{command.value}: {type(error).__name__}: {error}")
                 if command is ReadOnlyCommand.RUNTIME:
                     logger.debug(
                         "Runtime absent from primary output; trying the fixed fallback command"
@@ -121,6 +126,7 @@ class CliCollector:
                     warning_threshold_seconds,
                     source_command=command.value,
                     raw_value=measurement.raw_value,
+                    reason="; ".join(diagnostics) or None,
                 ),
                 commands_attempted=tuple(attempted),
             )
@@ -136,7 +142,7 @@ class CliCollector:
                 unavailable_status=RuntimeStatus.UNSUPPORTED
                 if all_unsupported
                 else RuntimeStatus.UNKNOWN,
-                reason=last_reason,
+                reason="; ".join(diagnostics) or "Runtime measurement unavailable",
             ),
             commands_attempted=tuple(attempted),
         )
