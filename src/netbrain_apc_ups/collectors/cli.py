@@ -93,8 +93,7 @@ class CliCollector:
             except Exception as error:
                 logger.exception("Unexpected error collecting approved APC command")
                 diagnostics.append(
-                    f"{command.value}: unexpected CLI collection error "
-                    f"({type(error).__name__})"
+                    f"{command.value}: unexpected CLI collection error ({type(error).__name__})"
                 )
                 return CliCollection(
                     runtime=evaluate_runtime_intent(
