@@ -2,6 +2,9 @@
 
 from apc_snmp_profiles import (
     ParsedTable,
+    build_v1_command,
+    build_v3_access_command,
+    build_v3_user_command,
     confirmed_blank_v1,
     confirmed_blank_v3_access,
     confirmed_blank_v3_user,
@@ -10,7 +13,6 @@ from apc_snmp_profiles import (
     verification_row,
     verify_readbacks,
 )
-
 
 V1_OUTPUT = """\
 SNMP Access Control
@@ -29,7 +31,7 @@ Access Control Entry #3
 Access Control Entry #4
  Community: public
  Access: disabled
- NMS IP/Host Name: 0.0.0.0
+ NMS IP/Host Name: 10.10.9.255
 """
 
 V3_OUTPUT = """\
@@ -66,7 +68,7 @@ Access Control Entry #3
 Access Control Entry #4
  User Name: apc snmp profile4
  Access: disabled
- NMS IP/Host Name: 0.0.0.0
+ NMS IP/Host Name: 10.10.9.255
 """
 
 
@@ -79,6 +81,7 @@ def test_parses_four_snmpv1_access_entries_and_preserves_wildcard_address() -> N
     assert not confirmed_blank_v1(parsed, 1)
     assert confirmed_blank_v1(parsed, 2)
     assert not confirmed_blank_v1(parsed, 3)
+    assert not confirmed_blank_v1(parsed, 4)
 
 
 def test_parses_separate_snmpv3_user_and_access_tables() -> None:
@@ -92,6 +95,7 @@ def test_parses_separate_snmpv3_user_and_access_tables() -> None:
     assert not confirmed_blank_v3_user(users, 1)
     assert confirmed_blank_v3_access(access, 2)
     assert not confirmed_blank_v3_access(access, 3)
+    assert not confirmed_blank_v3_access(access, 4)
 
 
 def test_accepts_whitespace_and_values_wrapped_to_indented_next_line() -> None:
@@ -175,3 +179,34 @@ def test_communities_are_redacted_in_csv_row() -> None:
     assert row["snmpv1_1_community"] == "<REDACTED>"
     assert row["snmpv1_2_community"] == "<REDACTED>"
     assert row["snmpv3_users_2_auth_passphrase"] == "<NOT READABLE>"
+
+
+def test_command_builder_preserves_exact_profile_index_mapping() -> None:
+    for index in (2, 3, 4):
+        user_command = build_v3_user_command(
+            index, "operator", "sha", "aes", "auth-secret", "privacy-secret"
+        )
+        access_command = build_v3_access_command(index, "operator", "192.0.2.20")
+
+        assert f"-u{index}" in user_command
+        assert f"-ap{index} sha" in user_command
+        assert f"-pp{index} aes" in user_command
+        assert f"-a{index} " in user_command
+        assert f"-c{index} " in user_command
+        assert f"-ac{index}" in access_command
+        assert f"-au{index}" in access_command
+        assert f"-n{index} 192.0.2.20" in access_command
+    assert build_v1_command(3, "community", "read", "192.0.2.30") == (
+        'snmp -c3 "community" -a3 read -n3 192.0.2.30'
+    )
+
+
+def test_command_builders_reject_profile_one_and_unsafe_arguments() -> None:
+    import pytest
+
+    with pytest.raises(ValueError):
+        build_v3_user_command(1, "operator", "sha", "aes", "auth-secret", "privacy-secret")
+    with pytest.raises(ValueError):
+        build_v3_access_command(1, "operator", "192.0.2.20")
+    with pytest.raises(ValueError):
+        build_v3_user_command(2, 'bad"; snmpv3 -S enable', "sha", "aes", "x", "y")

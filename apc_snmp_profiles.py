@@ -3,40 +3,40 @@
 from __future__ import annotations
 
 import csv
+import ipaddress
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
 
 ANSI_RE = re.compile(r"\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))")
 PROMPT_RE = re.compile(r"(?:[A-Za-z0-9_.-]+)?\s*>\s*$")
 TRUNCATION_RE = re.compile(r"(?:\.\.\.|-{1,2})\s*$")
 
 V1_FIELDS = {
-    "community": re.compile(r"^(?:SNMP\s*)?Community\s*:\s*(.*)$", re.I),
-    "access": re.compile(r"^(?:Access(?:\s+Type)?)\s*:\s*(.*)$", re.I),
+    "community": re.compile(r"^(?:SNMP\s*)?Community\s*:\s*(.*)$", re.IGNORECASE),
+    "access": re.compile(r"^(?:Access(?:\s+Type)?)\s*:\s*(.*)$", re.IGNORECASE),
     "address": re.compile(
-        r"^(?:NMS\s*IP(?:/Host\s*Name)?|Address|Host\s*Name)\s*:\s*(.*)$", re.I
+        r"^(?:NMS\s*IP(?:/Host\s*Name)?|Address|Host\s*Name)\s*:\s*(.*)$", re.IGNORECASE
     ),
 }
 V3_USER_FIELDS = {
-    "username": re.compile(r"^(?:User\s*Name|Username)\s*:\s*(.*)$", re.I),
+    "username": re.compile(r"^(?:User\s*Name|Username)\s*:\s*(.*)$", re.IGNORECASE),
     "authentication": re.compile(
-        r"^(?:Authentication(?:\s+Protocol)?|Auth(?:entication)?)\s*:\s*(.*)$", re.I
+        r"^(?:Authentication(?:\s+Protocol)?|Auth(?:entication)?)\s*:\s*(.*)$", re.IGNORECASE
     ),
     "privacy": re.compile(
-        r"^(?:Privacy(?:\s+Protocol)?|Encryption(?:\s+Protocol)?)\s*:\s*(.*)$", re.I
+        r"^(?:Privacy(?:\s+Protocol)?|Encryption(?:\s+Protocol)?)\s*:\s*(.*)$", re.IGNORECASE
     ),
 }
 V3_ACCESS_FIELDS = {
     "username": re.compile(
         r"^(?:Access\s+User(?:\s+Profile)?(?:\s+Name)?|User\s*Name|Username)\s*:\s*(.*)$",
-        re.I,
+        re.IGNORECASE,
     ),
-    "access": re.compile(r"^(?:Access|Status)\s*:\s*(.*)$", re.I),
+    "access": re.compile(r"^(?:Access|Status)\s*:\s*(.*)$", re.IGNORECASE),
     "address": re.compile(
-        r"^(?:NMS\s*IP(?:/Host\s*Name)?|Address|Host\s*Name)\s*:\s*(.*)$", re.I
+        r"^(?:NMS\s*IP(?:/Host\s*Name)?|Address|Host\s*Name)\s*:\s*(.*)$", re.IGNORECASE
     ),
 }
 
@@ -75,6 +75,59 @@ def normalize(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
 
 
+def _quoted_cli_value(value: str, field: str) -> str:
+    value = str(value).strip()
+    if not value or any(ord(char) < 32 or char in {'"', "\\", "`"} for char in value):
+        raise ValueError(f"{field} contains unsupported CLI characters")
+    return f'"{value}"'
+
+
+def _checked_ipv4(value: str, field: str) -> str:
+    value = str(value).strip()
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise ValueError(f"{field} must be an IPv4 address") from exc
+    if address.version != 4:
+        raise ValueError(f"{field} must be an IPv4 address")
+    return value
+
+
+def build_v1_command(index: int, community: str, access: str, address: str) -> str:
+    if index not in range(1, 5):
+        raise ValueError("SNMPv1 access index must be 1 through 4")
+    community_arg = _quoted_cli_value(community, "SNMPv1 community")
+    address = _checked_ipv4(address, "SNMPv1 NMS address")
+    return f"snmp -c{index} {community_arg} -a{index} {access} -n{index} {address}"
+
+
+def build_v3_user_command(
+    index: int,
+    username: str,
+    auth_protocol: str,
+    privacy_protocol: str,
+    auth_passphrase: str,
+    privacy_passphrase: str,
+) -> str:
+    if index not in range(2, 5):
+        raise ValueError("SNMPv3 user-profile writes are limited to indexes 2 through 4")
+    username_arg = _quoted_cli_value(username, "SNMPv3 username")
+    auth_arg = _quoted_cli_value(auth_passphrase, "SNMPv3 authentication passphrase")
+    privacy_arg = _quoted_cli_value(privacy_passphrase, "SNMPv3 privacy passphrase")
+    return (
+        f"snmpv3 -u{index} {username_arg} -ap{index} {auth_protocol} "
+        f"-pp{index} {privacy_protocol} -a{index} {auth_arg} -c{index} {privacy_arg}"
+    )
+
+
+def build_v3_access_command(index: int, username: str, address: str) -> str:
+    if index not in range(2, 5):
+        raise ValueError("SNMPv3 access-control writes are limited to indexes 2 through 4")
+    username_arg = _quoted_cli_value(username, "SNMPv3 access username")
+    address = _checked_ipv4(address, "SNMPv3 NMS address")
+    return f"snmpv3 -ac{index} enable -au{index} {username_arg} -n{index} {address}"
+
+
 def _heading_index(line: str, kind: str) -> int | None:
     if kind == "user":
         pattern = r"^(?:SNMPv3\s+)?User\s+Profile\s*(?:#\s*)?([1-4])\s*:?\s*$"
@@ -90,7 +143,7 @@ def _heading_index(line: str, kind: str) -> int | None:
         )
     else:
         raise ValueError(f"Unknown table kind: {kind}")
-    match = re.fullmatch(pattern, line.strip(), re.I)
+    match = re.fullmatch(pattern, line.strip(), re.IGNORECASE)
     return int(match.group(1)) if match else None
 
 
@@ -136,20 +189,13 @@ def _parse_blocks(text: str, kind: str, field_patterns: dict[str, re.Pattern[str
             pending_field = None
             previous_field = key
             continue
-        if (
-            raw_line[:1].isspace()
-            and previous_field
-            and line
-            and not _is_table_heading(line)
-        ):
+        if raw_line[:1].isspace() and previous_field and line and not _is_table_heading(line):
             blocks[current][previous_field] += f" {line}"
         else:
             previous_field = None
 
     required = set(field_patterns)
-    complete = all(
-        index in blocks and required.issubset(blocks[index]) for index in range(1, 5)
-    )
+    complete = all(index in blocks and required.issubset(blocks[index]) for index in range(1, 5))
     if duplicates:
         return ParsedTable(blocks, False, f"duplicate table entries: {sorted(duplicates)}")
     if not complete:
@@ -170,7 +216,7 @@ def _is_table_heading(line: str) -> bool:
             r"(?:(?:SNMPv[13])\s+)?(?:User\s+Profiles?|Access\s+Control(?:\s+Entries)?|"
             r"SNMPv[13])\s*:?",
             line.strip(),
-            re.I,
+            re.IGNORECASE,
         )
         or _heading_index(line, "user") is not None
         or _heading_index(line, "access") is not None
@@ -191,10 +237,10 @@ def _split_v3_sections(text: str) -> tuple[str, str] | None:
     access_heading: int | None = None
     for index, raw_line in enumerate(lines):
         line = raw_line.strip()
-        if re.fullmatch(r"(?:SNMPv3\s+)?User\s+Profiles?\s*:?", line, re.I):
+        if re.fullmatch(r"(?:SNMPv3\s+)?User\s+Profiles?\s*:?", line, re.IGNORECASE):
             user_heading = index
         elif re.fullmatch(
-            r"(?:SNMPv3\s+)?Access\s+Control(?:\s+Entries)?\s*:?", line, re.I
+            r"(?:SNMPv3\s+)?Access\s+Control(?:\s+Entries)?\s*:?", line, re.IGNORECASE
         ):
             access_heading = index
             break
@@ -208,7 +254,9 @@ def _split_v3_sections(text: str) -> tuple[str, str] | None:
 def parse_v3_output(text: str, *, partial: bool = False) -> tuple[ParsedTable, ParsedTable]:
     sections = _split_v3_sections(text)
     if sections is None:
-        unknown = ParsedTable({}, False, "separate user-profile and access-control headings not found")
+        unknown = ParsedTable(
+            {}, False, "separate user-profile and access-control headings not found"
+        )
         return unknown, unknown
     users = _parse_blocks(sections[0], "user", V3_USER_FIELDS)
     access = _parse_blocks(sections[1], "access", V3_ACCESS_FIELDS)
@@ -253,7 +301,8 @@ def confirmed_blank_v3_access(table: ParsedTable, index: int) -> bool:
 
 def extract_firmware(*outputs: str) -> str:
     pattern = re.compile(
-        r"^\s*(?:AOS|UPS|NMC|Firmware(?:\s+Version)?)\s*[:=]\s*(.*?)\s*$", re.I | re.M
+        r"^\s*(?:AOS|UPS|NMC|Firmware(?:\s+Version)?)\s*[:=]\s*(.*?)\s*$",
+        re.IGNORECASE | re.MULTILINE,
     )
     matches = []
     for output in outputs:
@@ -285,11 +334,7 @@ def verify_readbacks(
         status = "VERIFIED"
     else:
         status = "UNKNOWN"
-    errors = "; ".join(
-        reason
-        for reason in (v1.error, users.error, access.error)
-        if reason
-    )
+    errors = "; ".join(reason for reason in (v1.error, users.error, access.error) if reason)
     return {"snmpv1": v1, "snmpv3_users": users, "snmpv3_access": access}, (
         consistency,
         status,
@@ -339,7 +384,9 @@ def verification_row(
             values = table.entries.get(index, {})
             for field, value in values.items():
                 # Communities are credentials and must never be exported verbatim.
-                safe_value = "<REDACTED>" if name == "snmpv1" and field == "community" and value else value
+                safe_value = (
+                    "<REDACTED>" if name == "snmpv1" and field == "community" and value else value
+                )
                 row[f"{name}_{index}_{field}"] = safe_value
             if name == "snmpv3_users":
                 row[f"{name}_{index}_auth_passphrase"] = "<NOT READABLE>"
@@ -355,14 +402,18 @@ def verification_csv_columns() -> list[str]:
         "snmpv1_confident",
     ]
     for index in range(1, 5):
-        columns.extend(
-            f"snmpv1_{index}_{field}" for field in ("community", "access", "address")
-        )
+        columns.extend(f"snmpv1_{index}_{field}" for field in ("community", "access", "address"))
     columns.append("snmpv3_users_confident")
     for index in range(1, 5):
         columns.extend(
             f"snmpv3_users_{index}_{field}"
-            for field in ("username", "authentication", "privacy", "auth_passphrase", "privacy_passphrase")
+            for field in (
+                "username",
+                "authentication",
+                "privacy",
+                "auth_passphrase",
+                "privacy_passphrase",
+            )
         )
     columns.append("snmpv3_access_confident")
     for index in range(1, 5):

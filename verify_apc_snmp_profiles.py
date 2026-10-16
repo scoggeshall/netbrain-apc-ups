@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Read-only APC NMC SNMP profile verification; sends only `snmp` and `snmpv3`."""
 
 from __future__ import annotations
@@ -30,7 +29,7 @@ def read_credentials(path: Path) -> dict:
     with path.open("r", encoding="utf-8-sig") as stream:
         config = json.load(stream)
     if not isinstance(config, dict) or not isinstance(config.get("ssh"), dict):
-        raise ValueError("credentials file must contain an ssh object")
+        raise TypeError("credentials file must contain an ssh object")
     if not config["ssh"].get("username") or not config["ssh"].get("password"):
         raise ValueError("credentials file requires ssh.username and ssh.password")
     return config
@@ -52,7 +51,9 @@ def connect(host: str, ssh_cfg: dict, timeout: int):
     try:
         import paramiko
     except ImportError as exc:
-        raise RuntimeError("paramiko is required; install it with `python -m pip install paramiko`") from exc
+        raise RuntimeError(
+            "paramiko is required; install it with `python -m pip install paramiko`"
+        ) from exc
 
     client = paramiko.SSHClient()
     client.load_system_host_keys()
@@ -72,7 +73,7 @@ def connect(host: str, ssh_cfg: dict, timeout: int):
             client.connect(
                 hostname=host,
                 username=username,
-                ******
+                password=password,
                 timeout=timeout,
                 banner_timeout=timeout,
                 auth_timeout=timeout,
@@ -80,7 +81,7 @@ def connect(host: str, ssh_cfg: dict, timeout: int):
                 allow_agent=False,
             )
             return client
-        except Exception as exc:
+        except (paramiko.SSHException, OSError, TimeoutError) as exc:
             errors.append(type(exc).__name__)
     client.close()
     raise RuntimeError("SSH connection failed (" + ", ".join(errors or ["no credentials"]) + ")")
@@ -122,7 +123,7 @@ def run_read_only_command(shell, command: str, timeout: int) -> tuple[str, bool]
         stale = clean_cli_text(shell.recv(65535).decode("utf-8", errors="replace"))
         if stale.strip():
             raise RuntimeError("unexpected buffered CLI output; stopping without another command")
-    shell.send(command + "\r\n")
+    shell.sendall((command + "\r\n").encode("utf-8"))
     return _receive_until_prompt(shell, timeout)
 
 
@@ -168,7 +169,7 @@ def verify_device(host: str, config: dict, conn_timeout: int, cmd_timeout: int) 
             v1_partial=v1_partial,
             v3_partial=v3_partial,
         )
-    except Exception as exc:
+    except (OSError, TimeoutError, RuntimeError) as exc:
         is_connected = client is not None
         return verification_row(
             host,
@@ -211,7 +212,7 @@ def main() -> int:
             if args.host not in devices:
                 raise ValueError("--host must exactly match an IP in the device list")
             devices = [args.host]
-    except Exception as exc:
+    except (OSError, ValueError, csv.Error) as exc:
         parser.error(str(exc))
     output_path = args.output or (
         BASE / "Log" / f"snmp_profile_verification_{time.strftime('%Y%m%d_%H%M%S')}.csv"
@@ -222,7 +223,10 @@ def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[logging.FileHandler(log_path, encoding="utf-8"), logging.StreamHandler(sys.stdout)],
+        handlers=[
+            logging.FileHandler(log_path, encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
     )
     signal.signal(signal.SIGINT, handle_sigint)
     print(f"Read-only verification: {len(devices)} device(s), workers={args.workers}")
@@ -236,7 +240,9 @@ def main() -> int:
             while not _stop and next_index < len(devices) and len(futures) < args.workers:
                 host = devices[next_index]
                 next_index += 1
-                futures[pool.submit(verify_device, host, config, args.conn_timeout, args.cmd_timeout)] = host
+                futures[
+                    pool.submit(verify_device, host, config, args.conn_timeout, args.cmd_timeout)
+                ] = host
             if not futures:
                 break
             done = next((future for future in futures if future.done()), None)
@@ -246,7 +252,7 @@ def main() -> int:
             host = futures.pop(done)
             try:
                 row = done.result()
-            except Exception as exc:
+            except (OSError, TimeoutError, RuntimeError, ValueError) as exc:
                 row = verification_row(
                     host,
                     "",
