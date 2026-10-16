@@ -56,6 +56,14 @@ def test_timeout_does_not_trigger_another_command() -> None:
     assert transport.commands == ["detstatus -rt"]
 
 
+def test_os_error_does_not_trigger_another_command() -> None:
+    transport = FakeTransport({"detstatus -rt": OSError("connection refused")})
+    result = CliCollector(transport).collect_runtime("UPS-01")
+
+    assert result.runtime.status is RuntimeStatus.UNKNOWN
+    assert transport.commands == ["detstatus -rt"]
+
+
 def test_both_commands_unsupported_returns_unsupported() -> None:
     transport = FakeTransport(
         {

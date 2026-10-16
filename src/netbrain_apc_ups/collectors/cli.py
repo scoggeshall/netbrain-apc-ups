@@ -7,7 +7,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
 
-from netbrain_apc_ups.intents.runtime import RuntimeIntentResult, RuntimeStatus, evaluate_runtime_intent
+from netbrain_apc_ups.intents.runtime import (
+    RuntimeIntentResult,
+    RuntimeStatus,
+    evaluate_runtime_intent,
+)
 from netbrain_apc_ups.parsers.runtime import RuntimeParseError, parse_remaining_runtime
 
 logger = logging.getLogger(__name__)
@@ -21,20 +25,6 @@ class ReadOnlyCommand(str, Enum):
 # This allowlist is deliberately limited to the two runtime-intent commands.
 # Broader CLI safety/firmware compatibility verification remains outstanding.
 ALLOWED_COMMANDS = frozenset(ReadOnlyCommand)
-
-
-class CommandStatus(str, Enum):
-    OK = "OK"
-    UNSUPPORTED = "UNSUPPORTED"
-    ERROR = "ERROR"
-    TIMEOUT = "TIMEOUT"
-
-
-@dataclass(frozen=True)
-class CommandResult:
-    status: CommandStatus
-    output: str = ""
-    error: str | None = None
 
 
 class CliTransport(Protocol):
@@ -69,18 +59,24 @@ class CliCollector:
         warning_threshold_seconds: int | None = None,
     ) -> CliCollection:
         attempted: list[str] = []
+        unsupported_count = 0
         last_reason = "Runtime measurement unavailable"
         for command in (ReadOnlyCommand.RUNTIME, ReadOnlyCommand.DETAILS):
             attempted.append(command.value)
             try:
                 output = self._transport.execute_read_only(command.value, self._timeout_seconds)
             except UnsupportedCommandError:
+                unsupported_count += 1
                 last_reason = f"{command.value} is not supported by this device"
                 logger.info("Approved APC command is unsupported: %s", command.value)
                 continue
-            except (TimeoutError, ConnectionError) as error:
+            except (TimeoutError, OSError) as error:
                 status = RuntimeStatus.UNKNOWN
-                last_reason = "CLI collection timed out" if isinstance(error, TimeoutError) else "CLI connection failed"
+                last_reason = (
+                    "CLI collection timed out"
+                    if isinstance(error, TimeoutError)
+                    else "CLI connection failed"
+                )
                 return CliCollection(
                     runtime=evaluate_runtime_intent(
                         device_name,
@@ -112,7 +108,9 @@ class CliCollector:
             except RuntimeParseError as error:
                 last_reason = str(error)
                 if command is ReadOnlyCommand.RUNTIME:
-                    logger.debug("Runtime absent from primary output; trying the fixed fallback command")
+                    logger.debug(
+                        "Runtime absent from primary output; trying the fixed fallback command"
+                    )
                     continue
                 break
             return CliCollection(
@@ -127,7 +125,7 @@ class CliCollector:
                 commands_attempted=tuple(attempted),
             )
 
-        all_unsupported = last_reason.endswith("not supported by this device") and len(attempted) == 2
+        all_unsupported = len(attempted) == 2 and unsupported_count == 2
         return CliCollection(
             runtime=evaluate_runtime_intent(
                 device_name,
@@ -135,7 +133,9 @@ class CliCollector:
                 threshold_seconds,
                 warning_threshold_seconds,
                 source_command=attempted[-1] if attempted else None,
-                unavailable_status=RuntimeStatus.UNSUPPORTED if all_unsupported else RuntimeStatus.UNKNOWN,
+                unavailable_status=RuntimeStatus.UNSUPPORTED
+                if all_unsupported
+                else RuntimeStatus.UNKNOWN,
                 reason=last_reason,
             ),
             commands_attempted=tuple(attempted),

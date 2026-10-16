@@ -83,7 +83,9 @@ def parse_remaining_runtime(output: str) -> RuntimeMeasurement:
     if not isinstance(output, str):
         raise TypeError("CLI output must be a string")
 
-    values = [match.group(1).strip() for line in output.splitlines() if (match := _FIELD.match(line))]
+    values = [
+        match.group(1).strip() for line in output.splitlines() if (match := _FIELD.match(line))
+    ]
     if not values:
         raise MissingRuntimeError("No runtime field found")
     if len(values) != 1:
