@@ -10,13 +10,10 @@ Safety:
 - If a write response is ambiguous, read back state before deciding; stop further writes.
 - Logs redact configured secrets.
 
-Run:
-  py .\verify_apc_snmp_profiles.py --host 10.0.0.1
-  py .\configure_snmp_blank_profiles_only_verified_workers.py --host 10.0.0.1 --dry-run
-  py .\configure_snmp_blank_profiles_only_verified_workers.py --write --host 10.0.0.1
+Run with no arguments to process every device in device_list.csv:
+  py .\configure_snmp_blank_profiles_only.py
 """
 
-import argparse
 import csv
 import json
 import logging
@@ -156,7 +153,11 @@ def connect(host, ssh_cfg, timeout):
         client.load_system_host_keys()
         if ssh_cfg.get("known_hosts"):
             client.load_host_keys(str(Path(ssh_cfg["known_hosts"]).expanduser()))
-        client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        # Accept first-seen host keys for this run, but continue to let Paramiko
+        # verify keys that are already present in the system/configured stores.
+        # AutoAddPolicy keeps newly seen keys in this client's in-memory store;
+        # it does not persist them to known_hosts.
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
             client.connect(
                 hostname=host,
@@ -168,6 +169,16 @@ def connect(host, ssh_cfg, timeout):
                 look_for_keys=False,
                 allow_agent=False,
             )
+            transport = client.get_transport()
+            if transport:
+                key = transport.get_remote_server_key()
+                fingerprint = key.get_fingerprint().hex()
+                log.info(
+                    "[%s] SSH host key accepted: %s SHA1:%s",
+                    host,
+                    key.get_name(),
+                    ":".join(fingerprint[i : i + 2] for i in range(0, len(fingerprint), 2)),
+                )
             return client
         except (paramiko.SSHException, OSError, TimeoutError) as exc:
             errors.append(f"{username}: {type(exc).__name__}")
@@ -528,7 +539,6 @@ def configure_device(
     config,
     conn_timeout,
     cmd_timeout,
-    dry_run=True,
 ):
     client = None
     write_attempted = False
@@ -550,17 +560,6 @@ def configure_device(
                 host,
                 "NO CHANGES (no blank/defaulted/partial slots matched enabled JSON profiles)",
             )
-
-        if dry_run:
-            for label, _command, _secret, tag in commands:
-                log.info(
-                    "[%s] DRY RUN %s category=%s index=%s (command not sent)",
-                    host,
-                    label,
-                    tag[0],
-                    tag[1],
-                )
-            return host, f"DRY RUN ({len(commands)} candidate command(s); no writes sent)"
 
         touched = set()
         for label, command, contains_secret, tag in commands:
@@ -653,6 +652,7 @@ def handle_sigint(signum, frame):
 
 
 def validate_verification_report(path, devices):
+    """Validate a verifier CSV for callers that still use report-gated tooling."""
     with path.open("r", newline="", encoding="utf-8-sig") as stream:
         reader = csv.DictReader(stream)
         if not reader.fieldnames or not {"device_ip", "verification_status"}.issubset(
@@ -677,40 +677,9 @@ def validate_verification_report(path, devices):
 
 def main():
     global LOG_FILE
-    parser = argparse.ArgumentParser(
-        description="Configure blank, defaulted, or partial APC NMC SNMP slots; skip complete slots."
-    )
-    parser.add_argument(
-        "--workers", type=int, default=5, help="Maximum concurrent devices (1-25; default 5)"
-    )
-    parser.add_argument(
-        "--conn-timeout", type=int, default=20, help="SSH connect/auth/banner timeout seconds"
-    )
-    parser.add_argument("--cmd-timeout", type=int, default=30, help="Per-command timeout seconds")
-    parser.add_argument("--host", help="Process only this exact host/IP from device_list.csv")
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument(
-        "--write", action="store_true", help="Allow configuration writes (requires explicit scope)"
-    )
-    mode.add_argument(
-        "--dry-run", action="store_true", help="Explicitly plan changes without any writes"
-    )
-    parser.add_argument(
-        "--allow-broader-run",
-        action="store_true",
-        help="Allow writes to the device list after a reviewed all-VERIFIED report",
-    )
-    parser.add_argument("--verification-report", type=Path)
-    parser.add_argument(
-        "--report-reviewed",
-        action="store_true",
-        help="Acknowledge that the verification report was reviewed before broader writes",
-    )
-    args = parser.parse_args()
-    if not 1 <= args.workers <= 25:
-        parser.error("--workers must be between 1 and 25")
-    if args.conn_timeout < 1 or args.cmd_timeout < 1:
-        parser.error("timeouts must be positive")
+    workers = 5
+    conn_timeout = 20
+    cmd_timeout = 30
     LOG_DIR.mkdir(exist_ok=True)
     LOG_FILE = LOG_DIR / f"configure_snmp_blank_profiles_only_{time.strftime('%Y%m%d_%H%M%S')}.log"
     logging.basicConfig(
@@ -730,45 +699,26 @@ def main():
         raw_devices = read_devices(DEVICE_FILE)
         devices = list(dict.fromkeys(raw_devices))
         duplicates = len(raw_devices) - len(devices)
-        if args.host:
-            if args.host not in devices:
-                raise ValueError("--host must exactly match an IP in device_list.csv")
-            devices = [args.host]
-        if args.write:
-            if args.host:
-                if args.allow_broader_run or args.verification_report or args.report_reviewed:
-                    raise ValueError("broader-run options cannot be combined with --host")
-            else:
-                if not args.allow_broader_run:
-                    raise ValueError("writes require --host or explicit --allow-broader-run")
-                if not args.verification_report or not args.report_reviewed:
-                    raise ValueError(
-                        "broader writes require --verification-report and --report-reviewed"
-                    )
-                validate_verification_report(args.verification_report, devices)
-        elif args.allow_broader_run or args.verification_report or args.report_reviewed:
-            raise ValueError("broader-run options are valid only with --write")
     except (OSError, ValueError, TypeError, KeyError, csv.Error) as exc:
         print(f"Setup error: {exc}")
         raise SystemExit(2)
 
-    dry_run = not args.write
     print(
-        f"Processing {len(devices)} unique device(s); workers={args.workers}; "
-        f"dry_run={dry_run}; write_enabled={args.write}"
+        f"Configuring blank/partial SNMP profiles on {len(devices)} CSV device(s); "
+        f"workers={workers}; writes enabled"
     )
     print(f"Log: {LOG_FILE}")
     if duplicates:
         print(f"Removed {duplicates} duplicate device-list row(s).")
 
     completed = 0
-    with ThreadPoolExecutor(max_workers=args.workers, thread_name_prefix="apc-nmc") as pool:
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="apc-nmc") as pool:
         futures = {}
         next_index = 0
         # Keep at most --workers tasks submitted at once so Ctrl+C prevents queueing
         # the remainder of the fleet.
         while next_index < len(devices) or futures:
-            while not _stop and next_index < len(devices) and len(futures) < args.workers:
+            while not _stop and next_index < len(devices) and len(futures) < workers:
                 host = devices[next_index]
                 next_index += 1
                 futures[
@@ -776,9 +726,8 @@ def main():
                         configure_device,
                         host,
                         config,
-                        args.conn_timeout,
-                        args.cmd_timeout,
-                        dry_run,
+                        conn_timeout,
+                        cmd_timeout,
                     )
                 ] = host
             if not futures:
@@ -800,4 +749,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
